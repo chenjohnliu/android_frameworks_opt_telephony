@@ -30,6 +30,7 @@ import static org.mockito.Matchers.eq;
 import static org.mockito.Matchers.nullable;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
@@ -61,6 +62,7 @@ import androidx.test.filters.MediumTest;
 import com.android.internal.telephony.FakeSmsContentProvider;
 import com.android.internal.telephony.InboundSmsHandler;
 import com.android.internal.telephony.InboundSmsTracker;
+import com.android.internal.telephony.WapPushOverSms;
 import com.android.internal.telephony.PhoneConstants;
 import com.android.internal.telephony.SmsBroadcastUndelivered;
 import com.android.internal.telephony.SmsHeader;
@@ -1250,5 +1252,167 @@ public class GsmInboundSmsHandlerTest extends TelephonyTest {
 
         assertEquals("IdleState", getCurrentState().getName());
 
+    }
+
+    @Test
+    public void testSetImsManager() {
+        ImsManager imsManager = Mockito.mock(ImsManager.class);
+        transitionFromStartupToIdle();
+        assertTrue(mGsmInboundSmsHandler.setImsManager(imsManager));
+    }
+
+    @Test
+    public void testNewMessageNotification_nullLaunchIntent_doesNotCrash() {
+        BroadcastReceiver receiver =
+                mGsmInboundSmsHandler.makeNewMessageNotificationActionReceiver();
+
+        when(mContext.getSystemService(Context.USER_SERVICE)).thenReturn(mUserManager);
+        when(mContext.getPackageManager()).thenReturn(mPackageManager);
+        when(mUserManager.isUserUnlocked()).thenReturn(true);
+
+        // getLaunchIntentForPackage returns null
+        when(mPackageManager.getLaunchIntentForPackage(anyString())).thenReturn(null);
+        Intent intent = new Intent("com.android.internal.telephony.OPEN_DEFAULT_SMS_APP");
+
+        transitionFromStartupToIdle();
+        receiver.onReceive(mContext, intent);
+
+        // There should not happen the invocation for below method, nor exception
+        verify(mContext, never()).startActivityAsUser(any(Intent.class), any(UserHandle.class));
+    }
+
+    @Test
+    public void testNewMessageNotification_nullSmsPackage_doesNotCrash() {
+        transitionFromStartupToIdle();
+
+        BroadcastReceiver receiver =
+                mGsmInboundSmsHandler.makeNewMessageNotificationActionReceiver();
+
+        when(mContext.getSystemService(Context.USER_SERVICE)).thenReturn(mUserManager);
+        when(mUserManager.isUserUnlocked()).thenReturn(true);
+        // ContentResolver returns null for the default package name for the SMS
+        Intent intent = new Intent("com.android.internal.telephony.OPEN_DEFAULT_SMS_APP");
+        receiver.onReceive(mContext, intent);
+
+        // There should not happen the invocation for below method, nor exception
+        verify(mContext, never()).startActivityAsUser(any(Intent.class), any(UserHandle.class));
+    }
+
+    @Test
+    @EnableFlags(android.view.flags.Flags.FLAG_REDACT_WEB_OTP_SMS_API)
+    @DisableFlags(android.view.flags.Flags.FLAG_REDACT_OTP_APP_COMPAT_API)
+    public void testGetIncludedTextClassifierTypes_enableWebOtpRedaction_containsWebOtpType() {
+        transitionFromStartupToIdle();
+        assertThat(InboundSmsHandler.getIncludedTextClassifierTypes())
+            .containsExactly(TextClassifier.TYPE_SMS_RETRIEVER_OTP,
+                             TextClassifier.TYPE_SMS_WEB_OTP);
+    }
+
+    @Test
+    @EnableFlags({
+        android.view.flags.Flags.FLAG_REDACT_WEB_OTP_SMS_API,
+        android.view.flags.Flags.FLAG_REDACT_OTP_APP_COMPAT_API})
+    public void testGetAdditionalOtpTrustedPackages() {
+        transitionFromStartupToIdle();
+
+        Bundle smsRetrieverOtpExtras = new Bundle();
+        smsRetrieverOtpExtras.putString(
+            TextClassifier.EXTRA_SMS_RETRIEVER_HASH_MATCHED_PACKAGE,
+            "sms_retriever_package");
+
+        ArrayList<String> webOtpTrustedPackages = new ArrayList<>();
+        webOtpTrustedPackages.add("web_otp_package");
+        Bundle webOtpExtras = new Bundle();
+        webOtpExtras.putStringArrayList(
+            TextClassifier.EXTRA_OTP_TRUSTED_PACKAGES,
+            webOtpTrustedPackages);
+
+        assertThat(InboundSmsHandler.getOtpTrustedPackagesFromTextLinks(
+            new TextLinks.Builder("")
+                .addLink(0, 0,
+                    Collections.singletonMap(TextClassifier.TYPE_SMS_RETRIEVER_OTP, 1.0f),
+                    smsRetrieverOtpExtras)
+                .addLink(0, 0,
+                    Collections.singletonMap(TextClassifier.TYPE_SMS_WEB_OTP, 1.0f),
+                    webOtpExtras)
+                .build().getLinks()))
+            .containsExactly("sms_retriever_package", "web_otp_package");
+    }
+
+    @Test
+    @MediumTest
+    public void testBroadcastSms_nullTracker_failsGracefully() {
+        transitionFromStartupToIdle();
+
+        mGsmInboundSmsHandler.sendMessage(InboundSmsHandler.EVENT_BROADCAST_SMS, null);
+        processAllMessages();
+
+        // Should return to IdleState
+        assertEquals("IdleState", getCurrentState().getName());
+    }
+
+    @Test
+    @MediumTest
+    public void testBroadcastSms_RuntimeExceptionInDecoder_deletesTracker() throws Exception {
+        transitionFromStartupToIdle();
+
+        // Mock WapPushOverSms to throw RuntimeException
+        WapPushOverSms mockWapPush = Mockito.mock(WapPushOverSms.class);
+        doThrow(new RuntimeException("Test Exception"))
+                .when(mockWapPush)
+                .dispatchWapPdu(any(), any(), any(), any(), anyInt(), anyLong());
+
+        java.lang.reflect.Field field = InboundSmsHandler.class.getDeclaredField("mWapPush");
+        field.setAccessible(true);
+        field.set(mGsmInboundSmsHandler, mockWapPush);
+
+        // Create WAP tracker
+        InboundSmsTracker wapTracker = new InboundSmsTracker(
+                mContext,
+                mSmsPdu, /* pdu */
+                System.currentTimeMillis(), /* timestamp */
+                SmsHeader.PORT_WAP_PUSH, /* destPort */
+                true, /* is3gpp2 */
+                false, /* is3gpp2WapPdu */
+                "1234567890", /* address */
+                "1234567890", /* displayAddress */
+                mMessageBody, /* messageBody */
+                false, /* isClass0 */
+                mSubId0,
+                InboundSmsHandler.SOURCE_NOT_INJECTED);
+
+        // Insert tracker to database so it exists when we try to delete it
+        ContentValues values = wapTracker.getContentValues();
+        values.put("pdu", com.android.internal.util.HexDump.toHexString(mSmsPdu));
+        Uri newUri = mContentResolver.insert(sRawUri, values);
+        long rowId = android.content.ContentUris.parseId(newUri);
+        wapTracker.setDeleteWhere(
+                InboundSmsHandler.SELECT_BY_ID, new String[]{Long.toString(rowId)});
+
+        // Mock the makeInboundSmsTracker to return our wapTracker
+        doReturn(wapTracker).when(mTelephonyComponentFactory)
+                .makeInboundSmsTracker(any(Context.class), nullable(byte[].class), anyLong(),
+                        anyInt(), anyBoolean(),
+                        anyBoolean(), nullable(String.class), nullable(String.class),
+                        nullable(String.class), anyBoolean(), anyInt(), anyInt());
+
+        // Assert tracker is in database before
+        try (Cursor cursorBefore = mContentProvider.query(
+                sRawUri, null, "deleted=0", null, null)) {
+            assertEquals(1, cursorBefore.getCount());
+        }
+
+        // Send EVENT_BROADCAST_SMS
+        mGsmInboundSmsHandler.sendMessage(InboundSmsHandler.EVENT_BROADCAST_SMS, wapTracker);
+        processAllMessages();
+
+        // Assert tracker is deleted from database
+        try (Cursor cursorAfter = mContentProvider.query(
+                sRawUri, null, "deleted=0", null, null)) {
+            assertEquals(0, cursorAfter.getCount());
+        }
+
+        // Should return to IdleState
+        assertEquals("IdleState", getCurrentState().getName());
     }
 }
