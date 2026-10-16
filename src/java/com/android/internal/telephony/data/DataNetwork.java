@@ -576,6 +576,35 @@ public class DataNetwork extends StateMachine {
      */
     private @Nullable DataProfile mHandoverDataProfile;
 
+    /** Identity of the in-flight handover; callbacks retain this exact object. */
+    private @Nullable HandoverAttempt mHandoverAttempt;
+
+    private int mHandoverAttemptSerial;
+
+    private static final class HandoverAttempt {
+        final int id;
+        final @TransportType int sourceTransport;
+        final @TransportType int targetTransport;
+        final @Nullable DataHandoverRetryEntry retryEntry;
+
+        HandoverAttempt(int id, @TransportType int sourceTransport,
+                @TransportType int targetTransport,
+                @Nullable DataHandoverRetryEntry retryEntry) {
+            this.id = id;
+            this.sourceTransport = sourceTransport;
+            this.targetTransport = targetTransport;
+            this.retryEntry = retryEntry;
+        }
+
+        @Override
+        public String toString() {
+            return "HandoverAttempt{id=" + id + ", source="
+                    + AccessNetworkConstants.transportTypeToString(sourceTransport)
+                    + ", target="
+                    + AccessNetworkConstants.transportTypeToString(targetTransport) + "}";
+        }
+    }
+
     /** The network capabilities of this data network. */
     private @NonNull NetworkCapabilities mNetworkCapabilities;
 
@@ -1139,7 +1168,6 @@ public class DataNetwork extends StateMachine {
                     // Ignore the events when not in the correct state.
                     log("Ignored " + eventToString(msg.what));
                     break;
-                case EVENT_NOTIFY_HANDOVER_STARTED_RESPONSE:
                 case EVENT_NOTIFY_HANDOVER_STARTED:
                     // We reach here if network is not in the right state.
                     if (msg.obj != null) {
@@ -1150,6 +1178,11 @@ public class DataNetwork extends StateMachine {
                     }
                     log("Ignore handover to " + AccessNetworkConstants
                             .transportTypeToString(msg.arg1) + " request.");
+                    break;
+                case EVENT_NOTIFY_HANDOVER_STARTED_RESPONSE:
+                case EVENT_HANDOVER_RESPONSE:
+                    // A timed-out attempt may respond after leaving HandoverState.
+                    logObsoleteHandoverResponse(msg);
                     break;
                 case EVENT_RADIO_NOT_AVAILABLE:
                     mFailCause = DataFailCause.RADIO_NOT_AVAILABLE;
@@ -1347,9 +1380,13 @@ public class DataNetwork extends StateMachine {
                     log("Notifying source transport "
                             + AccessNetworkConstants.transportTypeToString(mTransport)
                             + " that handover is about to start.");
+                    mHandoverAttempt = new HandoverAttempt(++mHandoverAttemptSerial,
+                            mTransport, msg.arg2,
+                            (DataHandoverRetryEntry) msg.obj);
+                    logl("Begin " + mHandoverAttempt + ", sourceCid=" + mCid.get(mTransport));
                     mDataServiceManagers.get(mTransport).startHandover(mCid.get(mTransport),
-                            obtainMessage(EVENT_NOTIFY_HANDOVER_STARTED_RESPONSE, 0, msg.arg2,
-                                    msg.obj));
+                            obtainMessage(EVENT_NOTIFY_HANDOVER_STARTED_RESPONSE,
+                                    mHandoverAttempt));
                     // We enter handover state here because this is the first action we do for
                     // handover.
                     transitionTo(mHandoverState);
@@ -1394,6 +1431,7 @@ public class DataNetwork extends StateMachine {
         @Override
         public void exit() {
             removeMessages(EVENT_STUCK_IN_TRANSIENT_STATE);
+            mHandoverAttempt = null;
         }
 
         @Override
@@ -1428,14 +1466,23 @@ public class DataNetwork extends StateMachine {
                     deferMessage(msg);
                     break;
                 case EVENT_NOTIFY_HANDOVER_STARTED_RESPONSE:
-                    onStartHandover(msg.arg2, (DataHandoverRetryEntry) msg.obj);
+                    if (msg.obj != mHandoverAttempt || mHandoverAttempt == null) {
+                        logObsoleteHandoverResponse(msg);
+                        break;
+                    }
+                    onStartHandover(mHandoverAttempt.targetTransport,
+                            mHandoverAttempt.retryEntry);
                     break;
                 case EVENT_HANDOVER_RESPONSE:
+                    if (msg.obj != mHandoverAttempt || mHandoverAttempt == null) {
+                        logObsoleteHandoverResponse(msg);
+                        break;
+                    }
                     int resultCode = msg.arg1;
                     DataCallResponse dataCallResponse =
                             msg.getData().getParcelable(DataServiceManager.DATA_CALL_RESPONSE);
                     onHandoverResponse(resultCode, dataCallResponse,
-                            (DataHandoverRetryEntry) msg.obj);
+                            mHandoverAttempt.retryEntry);
                     break;
                 case EVENT_STUCK_IN_TRANSIENT_STATE:
                     // enable detection only for valid timeout range
@@ -1449,6 +1496,15 @@ public class DataNetwork extends StateMachine {
                     int handoverFailureMode =
                             DataCallResponse.HANDOVER_FAILURE_MODE_NO_FALLBACK_RETRY_SETUP_NORMAL;
                     mFailCause = DataFailCause.ERROR_UNSPECIFIED;
+                    logl("Timeout " + mHandoverAttempt);
+                    // Release source-side handover state even if the start or target
+                    // service never answered. Late callbacks cannot complete this attempt.
+                    mDataServiceManagers.get(mTransport).cancelHandover(mCid.get(mTransport),
+                            obtainMessage(EVENT_NOTIFY_HANDOVER_CANCELLED_RESPONSE));
+                    if (mHandoverAttempt != null && mHandoverAttempt.retryEntry != null) {
+                        mHandoverAttempt.retryEntry.setState(DataRetryEntry.RETRY_STATE_FAILED);
+                    }
+                    trackHandoverFailure();
                     mDataNetworkCallback.invokeFromExecutor(
                             () -> mDataNetworkCallback.onHandoverFailed(DataNetwork.this,
                                     mFailCause, retry, handoverFailureMode));
@@ -3140,6 +3196,7 @@ public class DataNetwork extends StateMachine {
      */
     private void onStartHandover(@TransportType int targetTransport,
             @Nullable DataHandoverRetryEntry retryEntry) {
+        logl("Setup target for " + mHandoverAttempt);
         if (mTransport == targetTransport) {
             log("onStartHandover: The network is already on "
                     + AccessNetworkConstants.transportTypeToString(mTransport)
@@ -3186,7 +3243,7 @@ public class DataNetwork extends StateMachine {
                 mHandoverDataProfile, isModemRoaming, allowRoaming,
                 DataService.REQUEST_REASON_HANDOVER, mLinkProperties, mPduSessionId,
                 mNetworkSliceInfo, mHandoverDataProfile.getTrafficDescriptor(), true,
-                obtainMessage(EVENT_HANDOVER_RESPONSE, retryEntry));
+                obtainMessage(EVENT_HANDOVER_RESPONSE, mHandoverAttempt));
     }
 
     /**
@@ -3199,6 +3256,8 @@ public class DataNetwork extends StateMachine {
      */
     private void onHandoverResponse(@DataServiceCallback.ResultCode int resultCode,
             @Nullable DataCallResponse response, @Nullable DataHandoverRetryEntry retryEntry) {
+        logl("Complete " + mHandoverAttempt + ", result=" + resultCode
+                + ", targetCid=" + (response == null ? -1 : response.getId()));
         logl("onHandoverResponse: resultCode=" + DataServiceCallback.resultCodeToString(resultCode)
                 + ", response=" + response);
         mFailCause = getFailCauseFromDataCallResponse(resultCode, response);
@@ -3262,6 +3321,17 @@ public class DataNetwork extends StateMachine {
         int targetRat = getDataNetworkType(targetTransport);
 
         mDataCallSessionStats.onHandoverFailure(mFailCause, sourceRat, targetRat);
+    }
+
+    private void logObsoleteHandoverResponse(@NonNull Message message) {
+        DataCallResponse response = message.getData().getParcelable(
+                DataServiceManager.DATA_CALL_RESPONSE);
+        logl("Ignore obsolete " + eventToString(message.what) + ": " + message.obj
+                + ", active=" + mHandoverAttempt + ", currentTransport="
+                + AccessNetworkConstants.transportTypeToString(mTransport)
+                + ", targetCid=" + (response == null ? -1 : response.getId()));
+        // A CID can be reused by a newer attempt. Do not deactivate it without
+        // ownership information from the data service/controller.
     }
 
     /**

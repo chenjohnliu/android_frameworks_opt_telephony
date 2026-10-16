@@ -75,6 +75,8 @@ import com.android.internal.telephony.data.DataConfigManager.DataConfigManagerCa
 import com.android.internal.telephony.data.DataEvaluation.DataAllowedReason;
 import com.android.internal.telephony.data.DataNetwork.DataNetworkCallback;
 import com.android.internal.telephony.data.DataNetworkController.NetworkRequestList;
+import com.android.internal.telephony.data.DataRetryManager.DataHandoverRetryEntry;
+import com.android.internal.telephony.data.DataRetryManager.DataRetryEntry;
 import com.android.internal.telephony.data.LinkBandwidthEstimator.LinkBandwidthEstimatorCallback;
 import com.android.internal.telephony.metrics.DataCallSessionStats;
 
@@ -1074,6 +1076,123 @@ public class DataNetworkTest extends TelephonyTest {
         processAllMessages();
 
         assertThat(mDataNetworkUT.isConnected()).isFalse();
+    }
+
+    private List<Message> holdHandoverSetupResponses(DataServiceManager dsm) {
+        List<Message> responses = new ArrayList<>();
+        doAnswer(invocation -> {
+            responses.add((Message) invocation.getArguments()[10]);
+            return null;
+        }).when(dsm).setupDataCall(anyInt(), any(DataProfile.class), anyBoolean(),
+                anyBoolean(), anyInt(), any(), anyInt(), any(), any(), anyBoolean(),
+                any(Message.class));
+        return responses;
+    }
+
+    private void completeHeldHandover(Message message, int cid) {
+        DataCallResponse response = new DataCallResponse.Builder()
+                .setCause(DataFailCause.NONE)
+                .setId(cid)
+                .setLinkStatus(DataCallResponse.LINK_STATUS_ACTIVE)
+                .setProtocolType(ApnSetting.PROTOCOL_IPV4V6)
+                .setInterfaceName("ifname")
+                .setAddresses(Arrays.asList(new LinkAddress(IPV4_ADDRESS + "/32"),
+                        new LinkAddress(IPV6_ADDRESS + "/64")))
+                .setQosBearerSessions(Collections.emptyList())
+                .setTrafficDescriptors(Collections.emptyList())
+                .build();
+        message.getData().putParcelable(DataServiceManager.DATA_CALL_RESPONSE, response);
+        message.arg1 = DataServiceCallback.RESULT_SUCCESS;
+        message.sendToTarget();
+    }
+
+    @Test
+    public void testHandoverTimeoutCancelsSource() throws Exception {
+        setupDataNetwork();
+        doReturn(60_000).when(mDataConfigManager).getNetworkHandoverTimeoutMs();
+        holdHandoverSetupResponses(mMockedWlanDataServiceManager);
+
+        DataHandoverRetryEntry retryEntry = new DataHandoverRetryEntry(mDataNetworkUT, null, 0);
+        mDataNetworkUT.startHandover(AccessNetworkConstants.TRANSPORT_TYPE_WLAN, retryEntry);
+        processAllMessages();
+        assertThat(mDataNetworkUT.isHandoverInProgress()).isTrue();
+
+        mDataNetworkUT.sendMessage(20 /* EVENT_STUCK_IN_TRANSIENT_STATE */);
+        processAllMessages();
+
+        verify(mMockedWwanDataServiceManager).cancelHandover(eq(123), any(Message.class));
+        verify(mDataNetworkCallback).onHandoverFailed(eq(mDataNetworkUT),
+                eq(DataFailCause.ERROR_UNSPECIFIED),
+                eq(DataCallResponse.RETRY_DURATION_UNDEFINED),
+                eq(DataCallResponse.HANDOVER_FAILURE_MODE_NO_FALLBACK_RETRY_SETUP_NORMAL));
+        assertThat(mDataNetworkUT.isConnected()).isTrue();
+        assertThat(mDataNetworkUT.getTransport())
+                .isEqualTo(AccessNetworkConstants.TRANSPORT_TYPE_WWAN);
+        assertThat(mDataNetworkUT.getId()).isEqualTo(123);
+        assertThat(retryEntry.getState()).isEqualTo(DataRetryEntry.RETRY_STATE_FAILED);
+    }
+
+    @Test
+    public void testLateHandoverStartCannotStartNextAttempt() throws Exception {
+        setupDataNetwork();
+        doReturn(60_000).when(mDataConfigManager).getNetworkHandoverTimeoutMs();
+        List<Message> startResponses = new ArrayList<>();
+        doAnswer(invocation -> {
+            startResponses.add((Message) invocation.getArguments()[1]);
+            return null;
+        }).when(mMockedWwanDataServiceManager).startHandover(anyInt(), any(Message.class));
+        setSuccessfulSetupDataResponse(mMockedWlanDataServiceManager, 456);
+
+        mDataNetworkUT.startHandover(AccessNetworkConstants.TRANSPORT_TYPE_WLAN, null);
+        processAllMessages();
+        mDataNetworkUT.sendMessage(20 /* EVENT_STUCK_IN_TRANSIENT_STATE */);
+        processAllMessages();
+        mDataNetworkUT.startHandover(AccessNetworkConstants.TRANSPORT_TYPE_WLAN, null);
+        processAllMessages();
+        assertThat(startResponses).hasSize(2);
+
+        startResponses.get(0).sendToTarget();
+        processAllMessages();
+        verify(mMockedWlanDataServiceManager, never()).setupDataCall(anyInt(),
+                any(DataProfile.class), anyBoolean(), anyBoolean(), anyInt(), any(),
+                anyInt(), any(), any(), anyBoolean(), any(Message.class));
+        assertThat(mDataNetworkUT.isHandoverInProgress()).isTrue();
+
+        startResponses.get(1).sendToTarget();
+        processAllMessages();
+        verify(mDataNetworkCallback).onHandoverSucceeded(eq(mDataNetworkUT));
+        assertThat(mDataNetworkUT.getId()).isEqualTo(456);
+    }
+
+    @Test
+    public void testLateHandoverSuccessCannotCompleteNextAttempt() throws Exception {
+        setupDataNetwork();
+        doReturn(60_000).when(mDataConfigManager).getNetworkHandoverTimeoutMs();
+        List<Message> setupResponses = holdHandoverSetupResponses(mMockedWlanDataServiceManager);
+
+        mDataNetworkUT.startHandover(AccessNetworkConstants.TRANSPORT_TYPE_WLAN, null);
+        processAllMessages();
+        mDataNetworkUT.sendMessage(20 /* EVENT_STUCK_IN_TRANSIENT_STATE */);
+        processAllMessages();
+        mDataNetworkUT.startHandover(AccessNetworkConstants.TRANSPORT_TYPE_WLAN, null);
+        processAllMessages();
+        assertThat(setupResponses).hasSize(2);
+
+        completeHeldHandover(setupResponses.get(0), 456);
+        processAllMessages();
+        verify(mDataNetworkCallback, never()).onHandoverSucceeded(eq(mDataNetworkUT));
+        verify(mMockedWwanDataServiceManager, never()).deactivateDataCall(anyInt(),
+                anyInt(), any());
+        assertThat(mDataNetworkUT.isHandoverInProgress()).isTrue();
+        assertThat(mDataNetworkUT.getTransport())
+                .isEqualTo(AccessNetworkConstants.TRANSPORT_TYPE_WWAN);
+        assertThat(mDataNetworkUT.getId()).isEqualTo(123);
+
+        completeHeldHandover(setupResponses.get(1), 457);
+        processAllMessages();
+        verify(mDataNetworkCallback).onHandoverSucceeded(eq(mDataNetworkUT));
+        assertThat(mDataNetworkUT.isConnected()).isTrue();
+        assertThat(mDataNetworkUT.getId()).isEqualTo(457);
     }
 
     @Test

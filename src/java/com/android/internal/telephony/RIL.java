@@ -1132,6 +1132,8 @@ public class RIL extends BaseCommands implements CommandsInterface {
         if (RILJ_LOGD) {
             riljLog("Radio HAL version: " + mRadioVersion);
         }
+        // SEH1: one opt-in Samsung callback owner; no standard-radio requests.
+        if (proxies == null) M11SehRadioBridge.maybeStart(this, mContext, mPhoneId);
     }
 
     private boolean isRadioVersion2_0() {

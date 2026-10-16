@@ -3320,6 +3320,13 @@ public class ImsPhoneCallTracker extends CallTracker implements ImsPullCall {
                 updatePhoneState();
                 mPhone.initiateSilentRedial(reasonInfo.getExtraCode() ==
                         ImsReasonInfo.EXTRA_CODE_CALL_RETRY_EMERGENCY, eccCategory);
+            } else if (imsCall != null && findConnection(imsCall) != null) {
+                // onCallInitiating clears mPendingMO once the call is tracked. Some IMS services
+                // report a later setup failure without a separate onCallTerminated callback.
+                // Clear the tracked connection so Telecom does not remain in DIALING.
+                sendCallStartFailedDisconnect(imsCall, reasonInfo);
+                mMetrics.writeOnImsCallStartFailed(mPhone.getPhoneId(), imsCall.getCallSession(),
+                        reasonInfo);
             }
         }
 

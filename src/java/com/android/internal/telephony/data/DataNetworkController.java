@@ -34,6 +34,8 @@ import android.os.AsyncResult;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.Message;
+import android.os.PersistableBundle;
+import android.telecom.VideoProfile;
 import android.telephony.AccessNetworkConstants;
 import android.telephony.AccessNetworkConstants.AccessNetworkType;
 import android.telephony.AccessNetworkConstants.RadioAccessNetworkType;
@@ -79,6 +81,7 @@ import android.util.SparseArray;
 import android.util.SparseBooleanArray;
 
 import com.android.internal.annotations.VisibleForTesting;
+import com.android.internal.telephony.Call;
 import com.android.internal.telephony.Phone;
 import com.android.internal.telephony.PhoneConstants;
 import com.android.internal.telephony.SlidingWindowEventCounter;
@@ -133,6 +136,11 @@ import java.util.stream.Collectors;
  */
 public class DataNetworkController extends Handler {
     private static final boolean VDBG = false;
+
+    // Device/carrier opt-in; absent on all other profiles. Keep idle W2L's
+    // fresh-bearer workaround, but permit continuity for an established call.
+    private static final String KEY_M11Q_ACTIVE_CALL_W2L_HANDOVER_BOOL =
+            "m11q_active_call_w2l_handover_bool";
 
     /** Event for adding a network request. */
     private static final int EVENT_ADD_NETWORK_REQUEST = 2;
@@ -1936,7 +1944,13 @@ public class DataNetworkController extends Handler {
                             || rule.networkCapabilities.stream()
                             .anyMatch(capabilities::hasCapability)) {
                         log("evaluateDataNetworkHandover: Matched " + rule);
-                        if (rule.type == HandoverRule.RULE_TYPE_DISALLOWED) {
+                        if (rule.type == HandoverRule.RULE_TYPE_DISALLOWED
+                                && isActiveImsCallW2lHandoverAllowed(dataNetwork,
+                                        sourceAccessNetwork, targetAccessNetwork, rule)) {
+                            logl("Active-call W2L: preserving IMS call with HANDOVER on "
+                                    + dataNetwork);
+                            dataEvaluation.addDataAllowedReason(DataAllowedReason.NORMAL);
+                        } else if (rule.type == HandoverRule.RULE_TYPE_DISALLOWED) {
                             dataEvaluation.addDataDisallowedReason(
                                     DataDisallowedReason.NOT_ALLOWED_BY_POLICY);
                         } else {
@@ -1955,6 +1969,60 @@ public class DataNetworkController extends Handler {
         // Allow handover by default if no rule is found/not enabled by config.
         dataEvaluation.addDataAllowedReason(DataAllowedReason.NORMAL);
         return dataEvaluation;
+    }
+
+    /**
+     * Carrier-scoped exception to the idle IMS W2L workaround, not to service,
+     * VoPS or state eligibility checks. Use the existing make-before-break
+     * handover pipeline; never replace or re-dial the ongoing call here.
+     */
+    private boolean isActiveImsCallW2lHandoverAllowed(@NonNull DataNetwork dataNetwork,
+            int sourceAccessNetwork, int targetAccessNetwork, @NonNull HandoverRule rule) {
+        if (!dataNetwork.isConnected()
+                || sourceAccessNetwork != AccessNetworkType.IWLAN
+                || targetAccessNetwork != AccessNetworkType.EUTRAN
+                || rule.networkCapabilities.size() != 1
+                || !rule.networkCapabilities.contains(NetworkCapabilities.NET_CAPABILITY_IMS)
+                || !dataNetwork.getNetworkCapabilities().hasCapability(
+                        NetworkCapabilities.NET_CAPABILITY_IMS)
+                || dataNetwork.getNetworkCapabilities().hasCapability(
+                        NetworkCapabilities.NET_CAPABILITY_EIMS)) {
+            return false;
+        }
+
+        CarrierConfigManager configManager = mPhone.getContext().getSystemService(
+                CarrierConfigManager.class);
+        PersistableBundle config = configManager == null ? null
+                : configManager.getConfigForSubId(mPhone.getSubId());
+        if (config == null || !mDataConfigManager.isConfigCarrierSpecific()
+                || !config.getBoolean(KEY_M11Q_ACTIVE_CALL_W2L_HANDOVER_BOOL, false)) {
+            return false;
+        }
+
+        // Check the real WWAN registration, not the composite data RAT (which
+        // can still be IWLAN while LTE remains registered underneath).
+        NetworkRegistrationInfo target = mServiceState.getNetworkRegistrationInfo(
+                NetworkRegistrationInfo.DOMAIN_PS,
+                AccessNetworkConstants.TRANSPORT_TYPE_WWAN);
+        if (target == null || !target.isInService()) {
+            return false;
+        }
+        DataSpecificRegistrationInfo dsri = target.getDataSpecificInfo();
+        if (dsri == null || dsri.getVopsSupportInfo() == null
+                || !dsri.getVopsSupportInfo().isVopsSupported()) {
+            return false;
+        }
+
+        Phone imsPhone = mPhone.getImsPhone();
+        if (imsPhone == null || mPhone.isInEmergencyCall() || mPhone.isInEcm()
+                || imsPhone.isInEmergencyCall() || imsPhone.isInEcm()) {
+            return false;
+        }
+        Call call = imsPhone.getForegroundCall();
+        return call != null && call.getState() == Call.State.ACTIVE
+                && !call.getConnections().isEmpty()
+                && call.getConnections().stream().allMatch(connection
+                        -> connection.getVideoState() == VideoProfile.STATE_AUDIO_ONLY);
     }
 
     /**

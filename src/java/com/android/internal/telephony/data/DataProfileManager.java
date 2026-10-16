@@ -353,6 +353,9 @@ public class DataProfileManager extends Handler {
             profilesChanged = true;
         }
 
+        // SEH1: immutable snapshot on this handler, including unchanged-profile updates.
+        com.android.internal.telephony.M11SehProfilePublisher.publish(mPhone, mAllDataProfiles);
+
         updateDataProfilesAtModem();
         updateInitialAttachDataProfileAtModem(forceUpdateIa);
 
