@@ -35,6 +35,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.Message;
 import android.os.PersistableBundle;
+import android.os.SystemProperties;
 import android.telecom.VideoProfile;
 import android.telephony.AccessNetworkConstants;
 import android.telephony.AccessNetworkConstants.AccessNetworkType;
@@ -72,6 +73,7 @@ import android.telephony.ims.ImsRegistrationAttributes;
 import android.telephony.ims.ImsStateCallback;
 import android.telephony.ims.RegistrationManager;
 import android.telephony.ims.feature.ImsFeature;
+import android.telephony.ims.stub.ImsRegistrationImplBase;
 import android.text.TextUtils;
 import android.util.ArrayMap;
 import android.util.ArraySet;
@@ -347,6 +349,10 @@ public class DataNetworkController extends Handler {
      */
     private final @NonNull SparseArray<RegistrationManager.RegistrationCallback>
             mImsFeatureRegistrationCallbacks = new SparseArray<>();
+
+    /** Current MMTEL registration technology, or NONE when MMTEL is not registered. */
+    private volatile int mMmtelRegistrationTechnology =
+            ImsRegistrationImplBase.REGISTRATION_TECH_NONE;
 
     /** The counter to detect back to back release/request IMS network. */
     private @NonNull SlidingWindowEventCounter mImsThrottleCounter;
@@ -2206,16 +2212,42 @@ public class DataNetworkController extends Handler {
                 new RegistrationManager.RegistrationCallback() {
                     @Override
                     public void onRegistered(ImsRegistrationAttributes attributes) {
+                        if (subId != mSubId
+                                || mImsFeatureRegistrationCallbacks.get(imsFeature) != this) {
+                            return;
+                        }
                         log("IMS " + DataUtils.imsFeatureToString(imsFeature)
                                 + " registered. Attributes=" + attributes);
                         mRegisteredImsFeatures.add(imsFeature);
+                        if (imsFeature == ImsFeature.FEATURE_MMTEL) {
+                            updateMmtelRegistrationTechnology(
+                                    attributes.getRegistrationTechnology(), subId, this);
+                        }
+                    }
+
+                    @Override
+                    public void onRegistering(ImsRegistrationAttributes attributes) {
+                        if (subId == mSubId
+                                && mImsFeatureRegistrationCallbacks.get(imsFeature) == this
+                                && imsFeature == ImsFeature.FEATURE_MMTEL) {
+                            updateMmtelRegistrationTechnology(
+                                    ImsRegistrationImplBase.REGISTRATION_TECH_NONE, subId, this);
+                        }
                     }
 
                     @Override
                     public void onUnregistered(ImsReasonInfo info) {
+                        if (subId != mSubId
+                                || mImsFeatureRegistrationCallbacks.get(imsFeature) != this) {
+                            return;
+                        }
                         log("IMS " + DataUtils.imsFeatureToString(imsFeature)
                                 + " deregistered. Info=" + info);
                         mRegisteredImsFeatures.remove(imsFeature);
+                        if (imsFeature == ImsFeature.FEATURE_MMTEL) {
+                            updateMmtelRegistrationTechnology(
+                                    ImsRegistrationImplBase.REGISTRATION_TECH_NONE, subId, this);
+                        }
                         evaluatePendingImsDeregDataNetworks();
                     }
                 };
@@ -2266,6 +2298,35 @@ public class DataNetworkController extends Handler {
             log("Successfully unregistered " + DataUtils.imsFeatureToString(imsFeature)
                     + " registration state. sudId=" + subId);
             mImsFeatureRegistrationCallbacks.remove(imsFeature);
+            if (imsFeature == ImsFeature.FEATURE_MMTEL) {
+                setMmtelRegistrationTechnology(ImsRegistrationImplBase.REGISTRATION_TECH_NONE);
+            }
+        }
+    }
+
+    /** Return the cached technology without consulting IMS binder state. */
+    public int getCachedMmtelRegistrationTechnology() {
+        return mMmtelRegistrationTechnology;
+    }
+
+    private void updateMmtelRegistrationTechnology(int technology, int subId,
+            RegistrationManager.RegistrationCallback callback) {
+        if (subId != mSubId
+                || mImsFeatureRegistrationCallbacks.get(ImsFeature.FEATURE_MMTEL) != callback) {
+            return;
+        }
+        setMmtelRegistrationTechnology(technology);
+    }
+
+    private void setMmtelRegistrationTechnology(int technology) {
+        if (mMmtelRegistrationTechnology == technology) return;
+        mMmtelRegistrationTechnology = technology;
+        if (SamsungM11IwlanMtuPolicy.isM11qLegacyDevice(
+                SystemProperties.get("ro.product.device", ""),
+                SystemProperties.get("ro.telephony.iwlan_operation_mode", ""))) {
+            for (DataNetwork dataNetwork : mDataNetworkList) {
+                dataNetwork.onSamsungImsRegistrationTechnologyChanged(technology);
+            }
         }
     }
 
@@ -2279,12 +2340,22 @@ public class DataNetworkController extends Handler {
                 imsFeature -> new ImsStateCallback() {
                     @Override
                     public void onUnavailable(int reason) {
+                        if (subId != mSubId || mImsStateCallbacks.get(imsFeature) != this) {
+                            return;
+                        }
                         // Unregister registration state update when IMS service is unbound.
+                        if (imsFeature == ImsFeature.FEATURE_MMTEL) {
+                            setMmtelRegistrationTechnology(
+                                    ImsRegistrationImplBase.REGISTRATION_TECH_NONE);
+                        }
                         unregisterImsFeatureRegistrationState(subId, imsFeature);
                     }
 
                     @Override
                     public void onAvailable() {
+                        if (subId != mSubId || mImsStateCallbacks.get(imsFeature) != this) {
+                            return;
+                        }
                         mImsFeaturePackageName.put(imsFeature, ImsResolver.getInstance()
                                 .getConfiguredImsServicePackageName(mPhone.getPhoneId(),
                                         imsFeature));
@@ -2294,6 +2365,12 @@ public class DataNetworkController extends Handler {
 
                     @Override
                     public void onError() {
+                        if (imsFeature == ImsFeature.FEATURE_MMTEL && subId == mSubId
+                                && mImsStateCallbacks.get(imsFeature) == this) {
+                            setMmtelRegistrationTechnology(
+                                    ImsRegistrationImplBase.REGISTRATION_TECH_NONE);
+                            unregisterImsFeatureRegistrationState(subId, imsFeature);
+                        }
                     }
                 };
 
@@ -2320,6 +2397,8 @@ public class DataNetworkController extends Handler {
      * @param subId Subscription index.
      */
     private void unregisterImsStateCallbacks(int subId) {
+        unregisterImsFeatureRegistrationState(subId, ImsFeature.FEATURE_MMTEL);
+        unregisterImsFeatureRegistrationState(subId, ImsFeature.FEATURE_RCS);
         ImsStateCallback callback = mImsStateCallbacks.get(ImsFeature.FEATURE_MMTEL);
         if (callback != null) {
             mImsManager.getImsMmTelManager(subId).unregisterImsStateCallback(callback);
@@ -2333,21 +2412,34 @@ public class DataNetworkController extends Handler {
             mImsStateCallbacks.remove(ImsFeature.FEATURE_RCS);
             log("Unregister RCS state on sub " + subId);
         }
+        setMmtelRegistrationTechnology(ImsRegistrationImplBase.REGISTRATION_TECH_NONE);
     }
 
     /** Called when subscription info changed. */
     private void onSubscriptionChanged() {
         if (mSubId != mPhone.getSubId()) {
-            log("onDataConfigUpdated: mSubId changed from " + mSubId + " to "
-                    + mPhone.getSubId());
-            if (isImsGracefulTearDownSupported()) {
-                if (SubscriptionManager.isValidSubscriptionId(mPhone.getSubId())) {
-                    registerImsStateCallback(mPhone.getSubId());
-                } else {
-                    unregisterImsStateCallbacks(mSubId);
-                }
+            int oldSubId = mSubId;
+            int newSubId = mPhone.getSubId();
+            log("onDataConfigUpdated: mSubId changed from " + oldSubId + " to " + newSubId);
+            // Publish the new identity before registering callbacks; their initial state can be
+            // delivered immediately on this handler.
+            mSubId = newSubId;
+            setMmtelRegistrationTechnology(ImsRegistrationImplBase.REGISTRATION_TECH_NONE);
+            boolean shouldListenForImsState = isImsGracefulTearDownSupported()
+                    || SamsungM11IwlanMtuPolicy.isM11qLegacyDevice(
+                            SystemProperties.get("ro.product.device", ""),
+                            SystemProperties.get(
+                                    "ro.telephony.iwlan_operation_mode", ""));
+            if (oldSubId != newSubId
+                    && (mImsStateCallbacks.get(ImsFeature.FEATURE_MMTEL) != null
+                    || mImsStateCallbacks.get(ImsFeature.FEATURE_RCS) != null
+                    || mImsFeatureRegistrationCallbacks.get(ImsFeature.FEATURE_MMTEL) != null
+                    || mImsFeatureRegistrationCallbacks.get(ImsFeature.FEATURE_RCS) != null)) {
+                unregisterImsStateCallbacks(oldSubId);
             }
-            mSubId = mPhone.getSubId();
+            if (shouldListenForImsState && SubscriptionManager.isValidSubscriptionId(newSubId)) {
+                registerImsStateCallback(newSubId);
+            }
             updateSubscriptionPlans();
         }
     }

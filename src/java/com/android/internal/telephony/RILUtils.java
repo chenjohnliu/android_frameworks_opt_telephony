@@ -270,6 +270,7 @@ import android.net.InetAddresses;
 import android.net.LinkAddress;
 import android.net.LinkProperties;
 import android.os.SystemClock;
+import android.os.SystemProperties;
 import android.service.carrier.CarrierIdentifier;
 import android.telephony.AccessNetworkConstants;
 import android.telephony.Annotation;
@@ -3442,7 +3443,16 @@ public class RILUtils {
             if (!TextUtils.isEmpty(result.pcscf)) {
                 pcscfs = result.pcscf.split("\\s+");
             }
-            mtu = mtuV4 = mtuV6 = result.mtu;
+            if (isM11QLegacyIwlanMtuNormalizationEnabled()) {
+                // The 1.0 callback may carry the same packed value; decode only when both
+                // fields look like valid MTUs, preserving all scalar values unchanged.
+                int[] normalizedMtu = SamsungM11Mtu.decodeLegacyMtu(result.mtu);
+                mtu = normalizedMtu[0];
+                mtuV4 = normalizedMtu[1];
+                mtuV6 = normalizedMtu[2];
+            } else {
+                mtu = mtuV4 = mtuV6 = result.mtu;
+            }
             if (addresses != null) {
                 for (String address : addresses) {
                     laList.add(convertToLinkAddress(address));
@@ -3461,7 +3471,14 @@ public class RILUtils {
             dnses = result.dnses.toArray(new String[0]);
             gateways = result.gateways.toArray(new String[0]);
             pcscfs = result.pcscf.toArray(new String[0]);
-            mtu = mtuV4 = mtuV6 = result.mtu;
+            if (isM11QLegacyIwlanMtuNormalizationEnabled()) {
+                int[] normalizedMtu = SamsungM11Mtu.decodeLegacyMtu(result.mtu);
+                mtu = normalizedMtu[0];
+                mtuV4 = normalizedMtu[1];
+                mtuV6 = normalizedMtu[2];
+            } else {
+                mtu = mtuV4 = mtuV6 = result.mtu;
+            }
             if (addresses != null) {
                 for (String address : addresses) {
                     laList.add(convertToLinkAddress(address));
@@ -3589,6 +3606,12 @@ public class RILUtils {
                 .setSliceInfo(sliceInfo)
                 .setTrafficDescriptors(trafficDescriptors)
                 .build();
+    }
+
+    private static boolean isM11QLegacyIwlanMtuNormalizationEnabled() {
+        // The device/mode gate is required because packed MTU evidence is Samsung M11-specific.
+        return "m11q".equals(SystemProperties.get("ro.product.device"))
+                && "legacy".equals(SystemProperties.get("ro.telephony.iwlan_operation_mode"));
     }
 
     /**

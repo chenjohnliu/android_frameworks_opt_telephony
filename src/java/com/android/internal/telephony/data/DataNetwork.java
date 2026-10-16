@@ -42,6 +42,7 @@ import android.os.Looper;
 import android.os.Message;
 import android.os.Process;
 import android.os.SystemClock;
+import android.os.SystemProperties;
 import android.provider.Telephony;
 import android.telephony.AccessNetworkConstants;
 import android.telephony.AccessNetworkConstants.AccessNetworkType;
@@ -74,6 +75,7 @@ import android.telephony.data.NetworkSliceInfo;
 import android.telephony.data.QosBearerSession;
 import android.telephony.data.TrafficDescriptor;
 import android.telephony.data.TrafficDescriptor.OsAppId;
+import android.telephony.ims.stub.ImsRegistrationImplBase;
 import android.text.TextUtils;
 import android.util.ArrayMap;
 import android.util.IndentingPrintWriter;
@@ -109,6 +111,8 @@ import java.io.FileDescriptor;
 import java.io.PrintWriter;
 import java.math.BigInteger;
 import java.net.InetAddress;
+import java.net.NetworkInterface;
+import java.net.SocketException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -237,6 +241,9 @@ public class DataNetwork extends StateMachine {
      * transport.
      */
     private static final int EVENT_NOTIFY_HANDOVER_STARTED = 25;
+
+    /** Event for MMTEL registration technology changed. */
+    private static final int EVENT_MMTEL_REGISTRATION_TECH_CHANGED = 28;
 
     /**
      * Event for the response of notifying source transport that handover is about to be initiated
@@ -544,6 +551,12 @@ public class DataNetwork extends StateMachine {
 
     /** Data network controller. */
     private final @NonNull DataNetworkController mDataNetworkController;
+
+    /** Registration technology snapshot used only by the Samsung M11 MTU policy. */
+    private int mMmtelRegistrationTechnology = ImsRegistrationImplBase.REGISTRATION_TECH_NONE;
+
+    private final SamsungM11IwlanMtuPolicy mSamsungM11IwlanMtuPolicy =
+            new SamsungM11IwlanMtuPolicy();
 
     /** Data network controller callback. */
     private final @NonNull DataNetworkController.DataNetworkControllerCallback
@@ -903,6 +916,8 @@ public class DataNetwork extends StateMachine {
         mAccessNetworksManager = phone.getAccessNetworksManager();
         mVcnManager = mPhone.getContext().getSystemService(VcnManager.class);
         mDataNetworkController = phone.getDataNetworkController();
+        mMmtelRegistrationTechnology =
+                mDataNetworkController.getCachedMmtelRegistrationTechnology();
         mDataNetworkControllerCallback = new DataNetworkController.DataNetworkControllerCallback(
                 getHandler()::post) {
             @Override
@@ -940,6 +955,11 @@ public class DataNetwork extends StateMachine {
         // DataNetworkController might check if existing data network's capability can satisfy the
         // next network request within this window.
         updateNetworkCapabilities();
+    }
+
+    /** Called by the controller when current MMTEL registration technology changes. */
+    void onSamsungImsRegistrationTechnologyChanged(int technology) {
+        sendMessage(obtainMessage(EVENT_MMTEL_REGISTRATION_TECH_CHANGED, technology, 0));
     }
 
     /**
@@ -1117,6 +1137,13 @@ public class DataNetwork extends StateMachine {
                     updateNetworkCapabilities();
                     break;
                 }
+                case EVENT_MMTEL_REGISTRATION_TECH_CHANGED:
+                    mMmtelRegistrationTechnology = msg.arg1;
+                    if (mDataCallResponse != null && mNetworkAgent != null
+                            && (isConnected() || isHandoverInProgress())) {
+                        updateDataNetwork(mDataCallResponse);
+                    }
+                    break;
                 case EVENT_ATTACH_NETWORK_REQUEST: {
                     onAttachNetworkRequests((NetworkRequestList) msg.obj);
                     updateNetworkScore();
@@ -1593,6 +1620,7 @@ public class DataNetwork extends StateMachine {
         @Override
         public void enter() {
             logl("Data network disconnected. mEverConnected=" + mEverConnected);
+            mSamsungM11IwlanMtuPolicy.reset();
             // Preserve the list for onSetupDataFailed callback, because we need to pass that list
             // back to DataNetworkController, but after EVENT_DETACH_ALL_NETWORK_REQUESTS gets
             // processed, the network request list would become empty.
@@ -2357,6 +2385,56 @@ public class DataNetwork extends StateMachine {
             }
         }
 
+        final ApnSetting apnSetting = mDataProfile.getApnSetting();
+        final boolean dedicatedImsApn = apnSetting != null
+                && apnSetting.canHandleType(ApnSetting.TYPE_IMS)
+                && !apnSetting.canHandleType(ApnSetting.TYPE_DEFAULT)
+                && !apnSetting.canHandleType(ApnSetting.TYPE_EMERGENCY);
+        final String operatorNumerics = SystemProperties.get("gsm.sim.operator.numeric", "");
+        final boolean m11qImsScope = SamsungM11IwlanMtuPolicy.isApplicable(
+                SystemProperties.get("ro.product.device", ""),
+                SystemProperties.get("ro.telephony.iwlan_operation_mode", ""),
+                operatorNumerics, mPhone.getPhoneId(),
+                SubscriptionManager.isValidSubscriptionId(mSubId)
+                        && mSubId == mPhone.getSubId(), dedicatedImsApn,
+                AccessNetworkConstants.TRANSPORT_TYPE_WWAN, mTransport);
+
+        int kernelMtu = -1;
+        SamsungM11IwlanMtuPolicy.Result mtuResult =
+                new SamsungM11IwlanMtuPolicy.Result(mtuV4, mtuV6,
+                        Math.max(mtuV4, mtuV6), false, false);
+        if (m11qImsScope || mSamsungM11IwlanMtuPolicy.hasLease()) {
+            int interfaceIndex = -1;
+            boolean interfaceKnown = false;
+            String interfaceName = response.getInterfaceName();
+            try {
+                if (!TextUtils.isEmpty(interfaceName)) {
+                    NetworkInterface networkInterface = NetworkInterface.getByName(interfaceName);
+                    if (networkInterface != null) {
+                        interfaceIndex = networkInterface.getIndex();
+                        kernelMtu = networkInterface.getMTU();
+                        interfaceKnown = interfaceIndex > 0;
+                    }
+                }
+            } catch (SocketException e) {
+                // Keep the interface snapshot unknown. The policy fails closed and holds a
+                // matching active lease until a later data-network event supplies a snapshot.
+                log("Samsung M11 MTU interface snapshot unavailable");
+            }
+            mtuResult = mSamsungM11IwlanMtuPolicy.evaluate(m11qImsScope,
+                    mMmtelRegistrationTechnology
+                            == ImsRegistrationImplBase.REGISTRATION_TECH_IWLAN,
+                    interfaceName, interfaceIndex, response.getId(), interfaceKnown,
+                    kernelMtu, mtuV4, mtuV6);
+        }
+        mtuV4 = mtuResult.routeMtuV4;
+        mtuV6 = mtuResult.routeMtuV6;
+        if (mtuResult.changed) {
+            log("Samsung M11 MTU policy: kernel=" + kernelMtu + " reported="
+                    + Math.max(response.getMtuV4(), response.getMtuV6()) + " selected="
+                    + mtuResult.linkMtu);
+        }
+
         // Set MTU for each route.
         for (InetAddress gateway : response.getGatewayAddresses()) {
             int mtu = gateway instanceof java.net.Inet6Address ? mtuV6 : mtuV4;
@@ -2367,7 +2445,7 @@ public class DataNetwork extends StateMachine {
         // LinkProperties.setMtu should be deprecated. The mtu for each route has been already
         // provided in addRoute() above. For backwards compatibility, we still need to provide
         // a value for the legacy MTU. Use the higher value of v4 and v6 value here.
-        linkProperties.setMtu(Math.max(mtuV4, mtuV6));
+        linkProperties.setMtu(mtuResult.linkMtu);
 
         if (mDataProfile.getApnSetting() != null
                 && !TextUtils.isEmpty(mDataProfile.getApnSetting().getProxyAddressAsString())) {
