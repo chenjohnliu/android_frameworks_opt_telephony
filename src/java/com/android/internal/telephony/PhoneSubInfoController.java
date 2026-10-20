@@ -37,6 +37,7 @@ import android.telephony.SubscriptionManager;
 import android.telephony.TelephonyFrameworkInitializer;
 import android.util.EventLog;
 
+import com.android.internal.telephony.uicc.IccRecords;
 import com.android.internal.telephony.uicc.IsimRecords;
 import com.android.internal.telephony.uicc.UiccCardApplication;
 import com.android.internal.telephony.uicc.UiccPort;
@@ -171,6 +172,31 @@ public class PhoneSubInfoController extends IPhoneSubInfo.Stub {
                 Binder.restoreCallingIdentity(identity);
             }
         }
+    }
+
+    @Override
+    public String getSubscriberIdForUiccAppType(int subId, int appType, String callingPackage,
+            String callingFeatureId) {
+        enforceCallingPackageUidMatched(callingPackage);
+        return callPhoneMethodForSubIdWithReadSubscriberIdentifiersCheck(subId, callingPackage,
+                callingFeatureId, "getSubscriberIdForUiccAppType", (phone) -> {
+                    if (phone.getSubId() != subId) {
+                        return null;
+                    }
+                    UiccPort uiccPort = phone.getUiccPort();
+                    if (uiccPort == null) {
+                        return null;
+                    }
+                    UiccCardApplication uiccApp = uiccPort.getApplicationByType(appType);
+                    if (uiccApp == null) {
+                        return null;
+                    }
+                    IccRecords records = uiccApp.getIccRecords();
+                    if (records == null) {
+                        return null;
+                    }
+                    return records.getIMSI();
+                });
     }
 
     @Deprecated
